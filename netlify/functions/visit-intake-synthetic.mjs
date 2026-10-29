@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 
 const json = (status, data) => new Response(JSON.stringify(data), {status, headers: {'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'}});
 const logError = (stage, details={}) => console.error('CARE360_VISIT_V11_FAILURE', {stage,...details});
@@ -21,7 +21,7 @@ export function fingerprint(body) {
   const canonical=JSON.stringify({client_request_id:body.client_request_id.toLowerCase(),preferred_date:body.preferred_date,preferred_period:body.preferred_period,notice_version:'SYNTHETIC-V0.3'});
   return createHash('sha256').update(canonical).digest('hex');
 }
-export default async function handler(request) {
+export default async function handler(request, context) {
   if (request.method!=='POST') return json(405,{error:'Method not allowed'});
   if (process.env.CARE360_VISIT_V11_ENABLED!=='true') return json(503,{error:'Synthetic intake disabled'});
   const allowed=process.env.CARE360_VISIT_V11_ALLOWED_ORIGIN;
@@ -37,6 +37,24 @@ export default async function handler(request) {
   const url=process.env.CARE360_VISIT_V11_SUPABASE_URL;
   const key=process.env.CARE360_VISIT_V11_SUPABASE_SECRET;
   if(!secret||!key||!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(url||'')) return json(503,{error:'Server configuration incomplete'});
+  // Fail closed when rate-limit configuration or trusted client identity is missing.
+  const rateSalt=process.env.CARE360_VISIT_V14_RATE_SALT;
+  const clientIp=context?.ip;
+  if (!rateSalt || rateSalt.length<32 || !clientIp || clientIp.length>64 || !/^[0-9a-fA-F:.]+$/.test(clientIp))
+    return json(503,{error:'Submission protection unavailable'});
+  const identifierHash=createHmac('sha256',rateSalt).update(clientIp).digest('hex');
+  const rateHeaders={'apikey':key,'content-type':'application/json'};
+  if (!key.startsWith('sb_secret_')) rateHeaders.authorization=`Bearer ${key}`;
+  let rateResponse;
+  try {
+    rateResponse=await fetch(url+'/rest/v1/rpc/care360_consume_synthetic_intake_quota',{
+      method:'POST',headers:rateHeaders,body:JSON.stringify({p_identifier_hash:identifierHash}),signal:AbortSignal.timeout(5000)});
+  } catch(e) {logError('rate_limit_unavailable',{type:e?.name||'unknown'});return json(503,{error:'Submission protection unavailable'});}
+  if (!rateResponse.ok) {logError('rate_limit_http',{status:rateResponse.status});return json(503,{error:'Submission protection unavailable'});}
+  let permitted;
+  try {permitted=await rateResponse.json();} catch {return json(503,{error:'Submission protection unavailable'});}
+  if (permitted===false) return json(429,{error:'Too many requests. Try later.'});
+  if (permitted!==true) return json(503,{error:'Submission protection unavailable'});
   let verification;
   try {
     const response=await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify',{
